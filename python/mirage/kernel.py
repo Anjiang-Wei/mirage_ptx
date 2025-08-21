@@ -18,6 +18,8 @@ from .graph_dataset import graph_dataset
 from collections import deque
 
 MAX_THREADS = os.cpu_count()
+DATASET_DIR = "/home/ubuntu/anjiang/PTX_dataset/mirage/dataset"
+GLOBAL_COUNTER = 0 # for naming the generated CUDA code
 
 HARD_CODE = """
 #include <Python.h>
@@ -457,6 +459,16 @@ class KNGraph:
                 os.makedirs(saved_addr, exist_ok=True)
                 with open(saved_addr + "test" + str(file_id) + ".cu", "w") as f:
                     f.write(result["code"] + HARD_CODE)
+            
+            # Copy generated CUDA code to dataset directory
+            os.makedirs(DATASET_DIR, exist_ok=True)
+            global GLOBAL_COUNTER
+            dataset_filename = f"generated_kernel_{GLOBAL_COUNTER}.cu"
+            GLOBAL_COUNTER += 1
+            dataset_filepath = os.path.join(DATASET_DIR, dataset_filename)
+            with open(dataset_filepath, "w") as f:
+                f.write(result["code"] + HARD_CODE)
+            print(f"CUDA code copied to dataset: {dataset_filepath}")
 
         cc = shutil.which("nvcc")
         if cc is None:
