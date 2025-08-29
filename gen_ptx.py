@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-Script to generate PTX files from CUDA kernels in the dataset directory.
+Script to generate PTX files from CUDA kernels in the dataset directory for multiple SM architectures.
 
 This script enumerates all .cu files in the dataset directory and compiles them
-to PTX format using nvcc with the specified GPU architecture and proper include paths.
+to PTX format using nvcc for SM80, SM90, and SM100 architectures with separate output folders.
 """
 
 import os
 import subprocess
 import sys
 import sysconfig
+import multiprocessing
+import time
 from pathlib import Path
 from typing import List, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 def get_key_paths():
@@ -141,7 +144,7 @@ def compile_cu_to_ptx(cu_file: Path, output_dir: str, py_include_dir: str, inclu
         py_include_dir: Path to the Python include directory
         include_path: Path to the include directory
         deps_path: Path to the deps directory
-        arch: GPU architecture (default: sm_80)
+        arch: GPU architecture (e.g., sm_80, sm_90, sm_100)
         
     Returns:
         Tuple of (success: bool, error_message: str)
@@ -153,9 +156,7 @@ def compile_cu_to_ptx(cu_file: Path, output_dir: str, py_include_dir: str, inclu
     # Build nvcc command with proper include paths
     cmd = get_ptx_compile_cmd(cu_file, ptx_path, py_include_dir, include_path, deps_path, arch)
     
-    print(f"Compiling: {cu_file.name} -> {ptx_filename}")
-    print(f"Command: {' '.join(cmd)}")
-    
+    # For parallel execution, reduce verbosity - progress is handled by the parallel wrapper
     try:
         # Run nvcc command
         result = subprocess.run(
@@ -165,32 +166,101 @@ def compile_cu_to_ptx(cu_file: Path, output_dir: str, py_include_dir: str, inclu
             check=True
         )
         
-        print(f"✓ Successfully compiled {cu_file.name}")
-        if result.stdout:
-            print(f"  stdout: {result.stdout.strip()}")
-        
         return True, ""
         
     except subprocess.CalledProcessError as e:
-        error_msg = f"✗ Failed to compile {cu_file.name}"
+        error_msg = f"Failed to compile ({arch}) {cu_file.name}"
         if e.stderr:
-            error_msg += f"\n  stderr: {e.stderr.strip()}"
+            error_msg += f" - stderr: {e.stderr.strip()}"
         if e.stdout:
-            error_msg += f"\n  stdout: {e.stdout.strip()}"
+            error_msg += f" - stdout: {e.stdout.strip()}"
         
-        print(error_msg)
         return False, error_msg
     
     except FileNotFoundError:
-        error_msg = "✗ nvcc command not found. Please ensure CUDA toolkit is installed and nvcc is in PATH."
-        print(error_msg)
+        error_msg = f"nvcc command not found when compiling {cu_file.name}. Please ensure CUDA toolkit is installed and nvcc is in PATH."
         return False, error_msg
 
 
-def main():
-    """Main function to orchestrate the PTX generation process."""
+def compile_files_parallel(cu_files: List[Path], output_dir: str, py_include_dir: str, include_path: str, deps_path: str, arch: str, max_workers: int = None) -> Tuple[int, int, List[str]]:
+    """
+    Compile multiple .cu files to PTX format in parallel.
     
-    print("=== CUDA to PTX Compiler ===")
+    Args:
+        cu_files: List of .cu files to compile
+        output_dir: Directory where to save the .ptx files
+        py_include_dir: Path to the Python include directory
+        include_path: Path to the include directory
+        deps_path: Path to the deps directory
+        arch: GPU architecture (e.g., sm_80, sm_90, sm_100)
+        max_workers: Maximum number of parallel workers (default: CPU count)
+        
+    Returns:
+        Tuple of (successful_count, failed_count, errors)
+    """
+    if max_workers is None:
+        # Use all available CPU cores for maximum parallelism
+        cpu_count = multiprocessing.cpu_count()
+        # For nvcc compilation, using all cores is usually optimal
+        max_workers = cpu_count
+    
+    print(f"Starting parallel compilation with {max_workers} workers (using all CPU cores) for {arch.upper()}...")
+    print(f"System has {multiprocessing.cpu_count()} CPU cores available")
+    print(f"Processing {len(cu_files)} files with {max_workers} parallel workers")
+    
+    successful_compilations = 0
+    failed_compilations = 0
+    errors = []
+    completed = 0
+    
+    start_time = time.time()
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all compilation jobs
+        future_to_file = {
+            executor.submit(compile_cu_to_ptx, cu_file, output_dir, py_include_dir, include_path, deps_path, arch): cu_file
+            for cu_file in cu_files
+        }
+        
+        # Process completed jobs
+        for future in as_completed(future_to_file):
+            cu_file = future_to_file[future]
+            completed += 1
+            
+            try:
+                success, error_msg = future.result()
+                if success:
+                    successful_compilations += 1
+                    print(f"[{completed:4d}/{len(cu_files)}] ✓ Success ({arch}): {cu_file.name}")
+                else:
+                    failed_compilations += 1
+                    errors.append(error_msg)
+                    print(f"[{completed:4d}/{len(cu_files)}] ✗ Failed ({arch}): {cu_file.name}")
+                    
+            except Exception as e:
+                failed_compilations += 1
+                error_msg = f"Exception compiling {cu_file.name}: {str(e)}"
+                errors.append(error_msg)
+                print(f"[{completed:4d}/{len(cu_files)}] ✗ Exception ({arch}): {cu_file.name} - {e}")
+            
+            # Progress indicator
+            if completed % 10 == 0 or completed == len(cu_files):
+                elapsed = time.time() - start_time
+                rate = completed / elapsed if elapsed > 0 else 0
+                eta = (len(cu_files) - completed) / rate if rate > 0 else 0
+                print(f"Progress ({arch}): {completed}/{len(cu_files)} ({successful_compilations} successful) "
+                      f"- {rate:.1f} files/sec - ETA: {eta/60:.1f}min")
+    
+    elapsed = time.time() - start_time
+    print(f"Parallel compilation completed in {elapsed/60:.1f} minutes ({len(cu_files)/elapsed:.1f} files/sec)")
+    
+    return successful_compilations, failed_compilations, errors
+
+
+def main():
+    """Main function to orchestrate the PTX generation process for multiple architectures."""
+    
+    print("=== CUDA to PTX Compiler (Multi-Architecture) ===")
     
     try:
         # Get the key paths for include directories
@@ -207,16 +277,20 @@ def main():
         print(f"Error: {e}")
         sys.exit(1)
     
+    # Define architectures and their corresponding output directories
+    architectures = [
+        ('sm_80', 'PTX_sm80'),
+        ('sm_90', 'PTX_sm90'),
+        ('sm_100', 'PTX_sm100')
+    ]
+    
     # Define paths
     dataset_dir = Path(MIRAGE_ROOT) / "dataset"
-    output_dir = Path(MIRAGE_ROOT) / "dataset_ptx"
-    
-    # Convert to absolute paths
     dataset_dir = dataset_dir.resolve()
-    output_dir = output_dir.resolve()
     
     print(f"Dataset directory: {dataset_dir}")
-    print(f"Output directory: {output_dir}")
+    print(f"Target architectures: {[arch for arch, _ in architectures]}")
+    print(f"Parallel processing: ENABLED using all {multiprocessing.cpu_count()} CPU cores")
     print()
     
     # Find all .cu files
@@ -225,39 +299,68 @@ def main():
         print("No .cu files found in the dataset directory!")
         sys.exit(1)
     
-    # Ensure output directory exists
-    ensure_output_directory(str(output_dir))
-    print()
+    # Track overall statistics
+    total_successful_compilations = 0
+    total_failed_compilations = 0
+    all_errors = []
     
-    # Compile each .cu file to PTX
-    successful_compilations = 0
-    failed_compilations = 0
-    errors = []
+    # Process each architecture
+    for arch, output_folder in architectures:
+        print(f"=== Processing {arch.upper()} Architecture ===")
+        
+        # Define output directory for this architecture
+        output_dir = Path(MIRAGE_ROOT) / output_folder
+        output_dir = output_dir.resolve()
+        
+        print(f"Output directory: {output_dir}")
+        
+        # Ensure output directory exists
+        ensure_output_directory(str(output_dir))
+        print()
+        
+        # Compile all .cu files to PTX for this architecture in parallel
+        successful_compilations, failed_compilations, errors = compile_files_parallel(
+            cu_files, str(output_dir), py_include_dir, INCLUDE_PATH, DEPS_PATH, arch
+        )
+        
+        # Print architecture summary
+        print(f"=== {arch.upper()} Architecture Summary ===")
+        print(f"Files processed: {len(cu_files)}")
+        print(f"Successful compilations: {successful_compilations}")
+        print(f"Failed compilations: {failed_compilations}")
+        
+        if errors:
+            print(f"\nErrors encountered for {arch.upper()}:")
+            for error in errors:
+                print(f"  {error}")
+        
+        # Update totals
+        total_successful_compilations += successful_compilations
+        total_failed_compilations += failed_compilations
+        all_errors.extend(errors)
+        
+        print()  # Add spacing between architectures
     
-    for cu_file in cu_files:
-        success, error_msg = compile_cu_to_ptx(cu_file, str(output_dir), py_include_dir, INCLUDE_PATH, DEPS_PATH)
-        if success:
-            successful_compilations += 1
-        else:
-            failed_compilations += 1
-            errors.append(error_msg)
-        print()  # Add spacing between files
+    # Print overall summary
+    print("=== Overall Compilation Summary ===")
+    print(f"Architectures processed: {len(architectures)}")
+    print(f"Total files per architecture: {len(cu_files)}")
+    print(f"Total compilations attempted: {len(cu_files) * len(architectures)}")
+    print(f"Total successful compilations: {total_successful_compilations}")
+    print(f"Total failed compilations: {total_failed_compilations}")
     
-    # Print summary
-    print("=== Compilation Summary ===")
-    print(f"Total files processed: {len(cu_files)}")
-    print(f"Successful compilations: {successful_compilations}")
-    print(f"Failed compilations: {failed_compilations}")
-    
-    if errors:
-        print("\nErrors encountered:")
-        for error in errors:
+    if all_errors:
+        print(f"\nTotal errors encountered: {len(all_errors)}")
+        print("First few errors:")
+        for error in all_errors[:5]:  # Show first 5 errors
             print(f"  {error}")
+        if len(all_errors) > 5:
+            print(f"  ... and {len(all_errors) - 5} more errors")
     
-    if failed_compilations > 0:
+    if total_failed_compilations > 0:
         sys.exit(1)
     else:
-        print("\n✓ All files compiled successfully!")
+        print("\n✓ All files compiled successfully for all architectures!")
 
 
 if __name__ == "__main__":
